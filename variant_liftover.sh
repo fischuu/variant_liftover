@@ -6,26 +6,30 @@ GENOME_OLD="genome.old.fasta"
 GENOME_NEW="genome.new.fasta"
 VARIANTS_FILE="variants.bed"
 OUTPUT_BED="lifted_over.bed"
+OUTPUT_VCF="lifted_over.vcf"
+VALIDATION_FILE="validation_results.txt"
 
 # Help message
 usage() {
-    echo "Usage: $0 [-f flank_size] [-o old_genome] [-n new_genome] [-v variants_file] [-b output_bed]"
+    echo "Usage: $0 [-f flank_size] [-o old_genome] [-n new_genome] [-v variants_file] [-b output_bed] [-c output_vcf]"
     echo "  -f : Number of bases up/downstream to extract (default: 30)"
     echo "  -o : Fasta file of the old genome"
     echo "  -n : Fasta file of the new genome"
-    echo "  -v : Bed file with variants (chromosome, position)"
+    echo "  -v : Bed or vcf file with variants (chromosome, position)"
     echo "  -b : Output bed file with lifted-over positions"
+    echo "  -c : Output VCF file with lifted-over positions (if VCF input is provided)"
     exit 1
 }
 
 # Parse command line arguments
-while getopts "f:o:n:v:b:" opt; do
+while getopts "f:o:n:v:b:c:" opt; do
     case ${opt} in
         f ) FLANK_SIZE=$OPTARG ;;
         o ) GENOME_OLD=$OPTARG ;;
         n ) GENOME_NEW=$OPTARG ;;
         v ) VARIANTS_FILE=$OPTARG ;;
         b ) OUTPUT_BED=$OPTARG ;;
+        c ) OUTPUT_VCF=$OPTARG ;;
         * ) usage ;;
     esac
 done
@@ -33,6 +37,53 @@ done
 # Check required arguments
 if [[ -z "$GENOME_OLD" || -z "$GENOME_NEW" || -z "$VARIANTS_FILE" ]]; then
     usage
+fi
+
+# Index the genomes for samtools
+if [[ ! -f "$GENOME_OLD.fai" ]]; then
+    echo "Indexing old genome..."
+    samtools faidx "$GENOME_OLD"
+fi
+
+if [[ ! -f "$GENOME_NEW.fai" ]]; then
+    echo "Indexing new genome..."
+    samtools faidx "$GENOME_NEW"
+fi
+
+# Index the genomes for Bowtie2
+if [[ ! -f "${GENOME_OLD}.1.bt2" ]]; then
+    echo "Indexing old genome with Bowtie2..."
+    bowtie2-build "$GENOME_OLD" "${GENOME_OLD%.fasta}"
+fi
+
+if [[ ! -f "${GENOME_NEW}.1.bt2" ]]; then
+    echo "Indexing new genome with Bowtie2..."
+    bowtie2-build "$GENOME_NEW" "${GENOME_NEW%.fasta}"
+fi
+
+# Check if the input file is a VCF and convert to BED if necessary
+if [[ "$VARIANTS_FILE" == *.vcf || "$VARIANTS_FILE" == *.vcf.gz ]]; then
+    echo "Converting VCF to BED..."
+    
+    # If VCF is gzipped, use zcat, else cat
+    if [[ "$VARIANTS_FILE" == *.vcf.gz ]]; then
+        VCF_TOOL="zcat"
+    else
+        VCF_TOOL="cat"
+    fi
+
+    # Convert VCF to BED format
+    VARIANTS_BED="variants_converted.bed"
+    
+    $VCF_TOOL "$VARIANTS_FILE" | \
+    grep -v "^#" | \
+    awk -v FS="\t" -v OFS="\t" '{print $1, $2-1, $2}' > "$VARIANTS_BED"
+
+    VARIANTS_FILE_ORIG="$VARIANTS_FILE"
+    VARIANTS_FILE="$VARIANTS_BED"
+    INPUT_WAS_VCF=true
+else
+    INPUT_WAS_VCF=false
 fi
 
 # Temporary files for sequences and alignments
@@ -50,24 +101,129 @@ while read -r CHR POS _; do
     samtools faidx "$GENOME_OLD" "$CHR:$START-$END" >> "$FLANKS_FILE"
 done < "$VARIANTS_FILE"
 
-# Step 2: Align the flanking sequences to the old genome
-echo "Aligning flanking sequences to the old genome..."
-bwa mem "$GENOME_OLD" "$FLANKS_FILE" > "$ALIGN_OLD"
+# Clean up extra newlines in the FASTA file
+echo "Cleaning up the FASTA file..."
+awk '/^>/ {if (NR!=1) print ""; print; next} {printf "%s", $0}' "$FLANKS_FILE" > "${FLANKS_FILE}_cleaned"
+mv "${FLANKS_FILE}_cleaned" "$FLANKS_FILE"
 
-# Step 3: Align the flanking sequences to the new genome
+# Step 2: Align the flanking sequences to the old genome using bowtie2
+echo "Aligning flanking sequences to the old genome..."
+bowtie2 -x "${GENOME_OLD%.fasta}" -f "$FLANKS_FILE" -S "$ALIGN_OLD"
+
+# Step 3: Align the flanking sequences to the new genome using bowtie2
 echo "Aligning flanking sequences to the new genome..."
-bwa mem "$GENOME_NEW" "$FLANKS_FILE" > "$ALIGN_NEW"
+bowtie2 -x "${GENOME_NEW%.fasta}" -f "$FLANKS_FILE" -S "$ALIGN_NEW"
 
 # Step 4: Parse the alignments and generate the output BED file
-echo "Generating output BED file..."
-echo -e "#chrom\tstart\tend\tnew_chrom\tnew_start\tnew_end" > "$OUTPUT_BED"
+echo "Generating output files..."
+if [ "$INPUT_WAS_VCF" = true ]; then
+# Generate VCF output
+# Generate VCF output
+echo -e "##fileformat=VCFv4.2" > "$OUTPUT_VCF"
+echo -e "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO" >> "$OUTPUT_VCF"
 
-awk 'BEGIN{OFS="\t"} 
-    NR==FNR {if($3=="=") {old_pos[$1]=$4}} 
-    NR!=FNR {if($3=="=" && $1 in old_pos) {print $1, old_pos[$1], old_pos[$1]+60, $1, $4, $4+60}}' \
-    "$ALIGN_OLD" "$ALIGN_NEW" >> "$OUTPUT_BED"
+# Initialize counters directly in awk
+awk -v FLANK_SIZE=$FLANK_SIZE '
+    BEGIN {
+        FS = "\t"; 
+        old_entries_count = 0;
+        processed_entries_count = 0;
+        processed_vcf_entries_count = 0;
+    }
+
+    # Process old VCF
+    FILENAME == ARGV[1] {
+        if ($1 ~ /^#/) next;
+
+        pos_key = $1 ":" $2;
+        old_ref[pos_key] = $4;
+        old_alt[pos_key] = $5;
+        old_id[pos_key] = $3;
+        old_filter[pos_key] = $7;
+        old_info[pos_key] = $8;
+
+        old_entries_count++;
+        next;
+    }
+
+    # Process old alignment SAM
+    FILENAME == ARGV[2] {
+        if ($1 ~ /^@/) next;
+
+        if ($2 == 0 && !($1 in processed_old_reads)) {
+            old_chrom[$1] = $3;  # Store old chromosome information
+            old_pos[$1] = $4 + FLANK_SIZE + 1;  # Adjusted to FLANK_SIZE + 1
+            old_ref[$1] = substr($10, FLANK_SIZE + 2, 1);  # Adjusted to capture correct base
+
+            processed_old_reads[$1] = 1;
+            processed_entries_count++;
+        }
+        next;
+    }
+
+    # Process new alignment SAM
+    FILENAME == ARGV[3] {
+        if ($1 ~ /^@/) next;
+
+        if ($2 == 0 && $1 in old_pos) {
+            new_pos = $4 + FLANK_SIZE + 1;  # Adjusted to FLANK_SIZE + 1
+            ref_base = substr($10, FLANK_SIZE + 2, 1);  # Adjusted to get correct base
+
+            old_pos_key = old_chrom[$1] ":" old_pos[$1];  # Use the old chromosome
+            new_pos_key = $3 ":" new_pos;
+
+            if (old_pos_key in old_alt) {
+                alt_value = old_alt[old_pos_key];
+                id_value = old_id[old_pos_key];
+                filter_value = old_filter[old_pos_key];
+                info_value = old_info[old_pos_key];
+                old_ref_value = old_ref[old_pos_key];
+                old_chrom_value = old_chrom[$1];  # Store old chromosome for INFO field
+
+                print $3, new_pos, id_value, ref_base, alt_value, ".", filter_value, "OLD="old_pos[$1]";OLD_REF="old_ref_value";OLD_CHROM="old_chrom_value";INFO="info_value;
+                processed_vcf_entries_count++;
+            } else {
+                # Print debug information for missing ALT entries
+                print "Warning: No ALT entry found for" old_pos_key > "/dev/stderr";
+            }
+        } else {
+            # Print debug information for new alignment entries not found in old alignment
+            if (!(old_pos_key in old_alt)) {
+                print "Debug: New alignment entry not found in old VCF - Key:" old_pos_key > "/dev/stderr";
+            }
+        }
+    }
+
+    END {
+        print "Summary:" > "/dev/stderr";
+        print "Total old VCF entries: " old_entries_count > "/dev/stderr";
+        print "Total old alignment entries processed: " processed_entries_count > "/dev/stderr";
+        print "Total new alignment entries processed: " length(processed_old_reads) > "/dev/stderr";  # Count entries in processed_old_reads
+        print "Total VCF entries written: " processed_vcf_entries_count > "/dev/stderr";
+    }
+' "$VARIANTS_FILE_ORIG" "$ALIGN_OLD" "$ALIGN_NEW" >> "$OUTPUT_VCF"
+
+# Debug output message
+echo "Debugging complete. Check stderr for detailed debug information."
+
+else
+    # Generate BED output
+    echo -e "#chrom\tstart\tend\tnew_chrom\tnew_start\tnew_end" > "$OUTPUT_BED"
+
+    awk -v FLANK_SIZE=$FLANK_SIZE 'BEGIN{OFS="\t"} 
+        NR==FNR {if($3=="=") {old_pos[$1]=$4; old_start[$1]=$2}} 
+        NR!=FNR {if($3=="=" && $1 in old_pos) {print $1, old_start[$1], old_start[$1]+2*FLANK_SIZE, $1, $4, $4+2*FLANK_SIZE}}' \
+        "$ALIGN_OLD" "$ALIGN_NEW" >> "$OUTPUT_BED"
+fi
+
 
 # Clean up
 rm "$FLANKS_FILE" "$ALIGN_OLD" "$ALIGN_NEW"
 
-echo "Lift-over process complete. Results saved in $OUTPUT_BED"
+echo "Lift-over process complete."
+if [ "$INPUT_WAS_VCF" = true ]; then
+    echo "VCF results saved in $OUTPUT_VCF"
+else
+    echo "BED results saved in $OUTPUT_BED"
+fi
+echo "Validation results saved in $VALIDATION_FILE"
