@@ -75,9 +75,13 @@ if [[ "$VARIANTS_FILE" == *.vcf || "$VARIANTS_FILE" == *.vcf.gz ]]; then
     # Convert VCF to BED format
     VARIANTS_BED="variants_converted.bed"
     
+    #$VCF_TOOL "$VARIANTS_FILE" | \
+    #grep -v "^#" | \
+    #awk -v FS="\t" -v OFS="\t" '{print $1, $2-1, $2}' > "$VARIANTS_BED"
+
     $VCF_TOOL "$VARIANTS_FILE" | \
     grep -v "^#" | \
-    awk -v FS="\t" -v OFS="\t" '{print $1, $2-1, $2}' > "$VARIANTS_BED"
+    awk -v FS="\t" -v OFS="\t" '{print $1, $2-1, $2, $4, $5}' > "$VARIANTS_BED"
 
     VARIANTS_FILE_ORIG="$VARIANTS_FILE"
     VARIANTS_FILE="$VARIANTS_BED"
@@ -92,7 +96,12 @@ ALIGN_OLD="alignment_old.sam"
 ALIGN_NEW="alignment_new.sam"
 
 # Step 1: Extract flanking sequences from the old genome using samtools
-echo "Extracting flanking sequences..."
+# Temporary files for sequences and alignments
+OUTPUT_FILE="flanking_and_variant.txt"
+: > "$OUTPUT_FILE"
+
+# Step 1: Extract left, right flanking sequences and variant itself from the old genome using samtools
+echo "Extracting left, right flanking sequences and the variant itself..."
 while read -r CHR POS _; do
     START=$((POS - FLANK_SIZE))
     END=$((POS + FLANK_SIZE))
@@ -100,6 +109,33 @@ while read -r CHR POS _; do
     # Extract the sequence using samtools faidx
     samtools faidx "$GENOME_OLD" "$CHR:$START-$END" >> "$FLANKS_FILE"
 done < "$VARIANTS_FILE"
+
+
+while read -r CHR POS END REF ALT; do
+    # Calculate the positions for left flank, variant, and right flank
+    LEFT_START=$((POS - FLANK_SIZE + 1))
+    LEFT_END=$((POS))
+    
+    RIGHT_START=$((POS + 2))
+    RIGHT_END=$((POS + FLANK_SIZE + 1))
+    
+    VARIANT_START=$((POS + 1))
+    VARIANT_END=$((POS + 1))
+
+    LEFT_FLANK=$(samtools faidx "$GENOME_OLD" "$CHR:$LEFT_START-$LEFT_END" | grep -v "^>" | tr -d '\n')
+    VARIANT_SEQ=$(samtools faidx "$GENOME_OLD" "$CHR:$VARIANT_START-$VARIANT_END" | grep -v "^>" | tr -d '\n')
+    RIGHT_FLANK=$(samtools faidx "$GENOME_OLD" "$CHR:$RIGHT_START-$RIGHT_END" | grep -v "^>" | tr -d '\n')
+    
+    VARIANT_NAME="${CHR}_${VARIANT_END}";
+
+    # Write the extracted sequences and REF/ALT into the output file
+    echo -e "$LEFT_FLANK\t$RIGHT_FLANK\t$VARIANT_SEQ\t$VARIANT_NAME\t$REF\t$ALT" >> "$OUTPUT_FILE"
+done < "$VARIANTS_FILE"
+
+
+
+echo "Flanking sequences and variant extraction complete. Results saved to $OUTPUT_FILE."
+
 
 # Clean up extra newlines in the FASTA file
 echo "Cleaning up the FASTA file..."
@@ -143,6 +179,7 @@ awk -v FLANK_SIZE=$FLANK_SIZE '
         old_info[pos_key] = $8;
 
         old_entries_count++;
+
         next;
     }
 
@@ -165,10 +202,12 @@ awk -v FLANK_SIZE=$FLANK_SIZE '
     FILENAME == ARGV[3] {
         if ($1 ~ /^@/) next;
 
-        if ($2 == 0 && $1 in old_pos) {
+        # Check if this alignment is mapped (SAM flag field $2 != 4 means mapped)
+        if ($2 != 4 && $1 in old_pos) {
             new_pos = $4 + FLANK_SIZE + 1;  # Adjusted to FLANK_SIZE + 1
             ref_base = substr($10, FLANK_SIZE + 2, 1);  # Adjusted to get correct base
 
+            # Construct keys for both old and new alignments
             old_pos_key = old_chrom[$1] ":" old_pos[$1];  # Use the old chromosome
             new_pos_key = $3 ":" new_pos;
 
@@ -180,18 +219,18 @@ awk -v FLANK_SIZE=$FLANK_SIZE '
                 old_ref_value = old_ref[old_pos_key];
                 old_chrom_value = old_chrom[$1];  # Store old chromosome for INFO field
 
-                print $3, new_pos, id_value, ref_base, alt_value, ".", filter_value, "OLD="old_pos[$1]";OLD_REF="old_ref_value";OLD_CHROM="old_chrom_value";INFO="info_value;
+                # Print the tab-separated VCF line
+                print $3 "\t" new_pos "\t" id_value "\t" ref_base "\t" alt_value "\t.\t" filter_value "\tOLD=" old_pos[$1] ";OLD_REF=" old_ref_value ";OLD_CHROM=" old_chrom_value ";INFO=" info_value;
                 processed_vcf_entries_count++;
+
+                # Mark the read as processed so that only the first valid alignment is used
+                processed_new_reads[new_pos_key] = 1;
             } else {
                 # Print debug information for missing ALT entries
-                print "Warning: No ALT entry found for" old_pos_key > "/dev/stderr";
-            }
-        } else {
-            # Print debug information for new alignment entries not found in old alignment
-            if (!(old_pos_key in old_alt)) {
-                print "Debug: New alignment entry not found in old VCF - Key:" old_pos_key > "/dev/stderr";
+                print "Warning: No ALT entry found for " old_pos_key " - REF: " old_ref[old_pos_key] > "/dev/stderr";
             }
         }
+        
     }
 
     END {
@@ -216,9 +255,8 @@ else
         "$ALIGN_OLD" "$ALIGN_NEW" >> "$OUTPUT_BED"
 fi
 
-
 # Clean up
-rm "$FLANKS_FILE" "$ALIGN_OLD" "$ALIGN_NEW"
+#rm "$ALIGN_OLD" "$ALIGN_NEW"
 
 echo "Lift-over process complete."
 if [ "$INPUT_WAS_VCF" = true ]; then
