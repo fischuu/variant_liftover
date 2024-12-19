@@ -2,9 +2,9 @@
 
 # Set default values for parameters
 FLANK_SIZE=30
-GENOME_OLD="genome.old.fasta"
-GENOME_NEW="genome.new.fasta"
-VARIANTS_FILE="variants.bed"
+GENOME_OLD="old_genome.fa"
+GENOME_NEW="new_genome.fa"
+VARIANTS_FILE="variants_for_liftover.bed"
 OUTPUT_BED="lifted_over.bed"
 OUTPUT_VCF="lifted_over.vcf"
 VALIDATION_FILE="validation_results.txt"
@@ -20,6 +20,8 @@ usage() {
     echo "  -c : Output VCF file with lifted-over positions (if VCF input is provided)"
     exit 1
 }
+
+# bash variant_liftover.sh -f 30 -o old_genome.fa -n new_genome.fa -v variants_for_liftover.vcf -c variants_after_liftover_strand.vcf
 
 # Parse command line arguments
 while getopts "f:o:n:v:b:c:" opt; do
@@ -204,8 +206,18 @@ awk -v FLANK_SIZE=$FLANK_SIZE '
 
         # Check if this alignment is mapped (SAM flag field $2 != 4 means mapped)
         if ($2 != 4 && $1 in old_pos) {
-            new_pos = $4 + FLANK_SIZE + 1;  # Adjusted to FLANK_SIZE + 1
-            ref_base = substr($10, FLANK_SIZE + 2, 1);  # Adjusted to get correct base
+            if ($2 == 0) {
+                # Forward strand
+                new_pos = $4 + FLANK_SIZE + 1;  # Adjusted to FLANK_SIZE + 1
+                ref_base = substr($10, FLANK_SIZE + 2, 1);  # Adjusted to get correct base
+            } else if ($2 == 16) {
+                # Reverse strand
+                new_pos = $4 - FLANK_SIZE - 1;  # Adjust for reverse strand
+                ref_base = substr($10, length($10) - FLANK_SIZE - 1, 1);  # Extract base from reverse direction
+            } else {
+                # Other cases, if any, can be handled here
+                next;
+            }
 
             # Construct keys for both old and new alignments
             old_pos_key = old_chrom[$1] ":" old_pos[$1];  # Use the old chromosome

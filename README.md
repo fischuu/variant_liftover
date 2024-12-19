@@ -1,3 +1,10 @@
+################################################################################################################################################
+#####
+##### WARNING, THIS SCRIPT IS BUGGY AND SHOULD NOT BE USED!!! IT DOES NOT TAKE THE STRAND INFORMATION PROPERLY INTO ACCOUNT AND NEEDS FIXING!!!!
+#####
+################################################################################################################################################
+
+
 # variant_liftover
 A basic tool for lit over variant call files from one genome to another without need of liftover chain
 
